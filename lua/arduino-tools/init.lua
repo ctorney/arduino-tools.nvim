@@ -190,6 +190,9 @@ end
 
 -- Updated append_to_buffer function
 function M.append_to_buffer(lines, buf, win, opts)
+	if not buf or not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
 	-- Ensure lines is a table, even if a single string is passed
 	if type(lines) == "string" then
 		lines = { lines }
@@ -206,8 +209,11 @@ function M.append_to_buffer(lines, buf, win, opts)
 	local cleaned_lines = vim.tbl_map(strip_ansi_codes, processed_lines)
 	vim.api.nvim_buf_set_lines(buf, -1, -1, false, cleaned_lines)
 
+	-- local last_line = vim.api.nvim_buf_line_count(buf)
+	-- local last_col = vim.api.nvim_buf_get_lines(buf, last_line - 1, last_line, false)[1]:len()
+	vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
 	-- Adjust the window height if necessary
-	adjust_window_height(win, buf, opts)
+	-- adjust_window_height(win, buf, opts)
 end
 
 function M.upload()
@@ -384,7 +390,229 @@ function M.gui()
 	end)
 end
 
+function M.upload_and_monitor()
+	if M.job_id then
+		vim.fn.jobstop(M.job_id)
+		M.job_id = nil
+	end
+
+	-- delete the previous buffer if it exists
+	if M.buf ~= nil and vim.api.nvim_buf_is_valid(M.buf) then
+		vim.api.nvim_buf_delete(M.buf, { force = true })
+	end
+
+	-- Create the floating window and buffer
+	M.buf, M.win, M.win_opts = M.create_floating_window()
+
+	-- Set buffer options
+	-- vim.api.nvim_buf_set_option(buf, "modifiable", true)
+
+	-- Add a header to the buffer
+	vim.api.nvim_buf_set_lines(M.buf, 0, 0, false, {
+		"Arduino Upload and Serial Monitor - Press Ctrl-C to exit",
+		"Port: " .. M.port .. " | Baudrate: " .. M.baudrate,
+		"---------------------------------------------------",
+		"",
+	})
+
+	-- Function to append lines to the monitor buffer and adjust height
+	-- Strip ANSI codes from each line and append to buffer
+
+	-- Commands for compiling and uploading
+	local compile_cmd = "arduino-cli compile --fqbn "
+		.. M.board
+		.. " "
+		.. vim.fn.expand("%:p:h")
+		.. " --board-options flash=8388608_7340032"
+	local upload_cmd = "arduino-cli upload -p "
+		.. M.port
+		.. " --fqbn "
+		.. M.board
+		.. " "
+		.. vim.fn.expand("%:p:h")
+		.. " --board-options flash=8388608_7340032"
+
+	-- Function to start upload after successful compilation
+	local function start_upload()
+		vim.fn.jobstart(upload_cmd, {
+			stdout_buffered = false,
+			on_stdout = function(_, data)
+				if data then
+					M.append_to_buffer(data, M.buf, M.win, M.win_opts)
+				end
+			end,
+			on_stderr = function(_, data)
+				if data and #data > 0 and data[1]:match("%S") then -- Only log if there is actual error content
+					M.append_to_buffer(
+						vim.tbl_map(function(line)
+							return "Error: " .. line
+						end, data),
+						M.buf,
+						M.win,
+						M.win_opts
+					)
+				end
+			end,
+			on_exit = function(_, exit_code)
+				if exit_code == 0 then
+					M.append_to_buffer({ "--- Upload Complete ---" }, M.buf, M.win, M.win_opts)
+					M.monitor()
+				else
+					M.append_to_buffer({ "--- Upload Failed ---" }, M.buf, M.win, M.win_opts)
+					M.append_to_buffer({ "--- Ctrl-C to exit ---" }, M.buf, M.win, M.win_opts)
+					vim.api.nvim_buf_set_keymap(
+						M.buf,
+						"n",
+						"<C-c>",
+						string.format("<cmd>lua vim.api.nvim_buf_delete(%d, {force=true})<CR>", M.buf),
+						{ noremap = true, silent = true }
+					)
+				end
+			end,
+		})
+	end
+	-- save all files before uploading
+	vim.cmd("wa")
+	-- Start the compilation job
+	vim.fn.jobstart(compile_cmd, {
+		stdout_buffered = false,
+		on_stdout = function(_, data)
+			if data then
+				M.append_to_buffer(data, M.buf, M.win, M.win_opts)
+			end
+		end,
+		on_stderr = function(_, data)
+			if data and #data > 0 and data[1]:match("%S") then -- Only log if there is actual error content
+				M.append_to_buffer(
+					vim.tbl_map(function(line)
+						return "Error: " .. line
+					end, data),
+					M.buf,
+					M.win,
+					M.win_opts
+				)
+			end
+		end,
+		on_exit = function(_, exit_code)
+			if exit_code == 0 then
+				M.append_to_buffer({ "--- Compilation Complete, Starting Upload ---" }, M.buf, M.win, M.win_opts)
+				start_upload()
+			else
+				M.append_to_buffer({ "--- Compilation Failed ---" }, M.buf, M.win, M.win_opts)
+				M.append_to_buffer({ "--- Ctrl-C to exit ---" }, M.buf, M.win, M.win_opts)
+				vim.api.nvim_buf_set_keymap(
+					M.buf,
+					"n",
+					"<C-c>",
+					string.format("<cmd>lua vim.api.nvim_buf_delete(%d, {force=true})<CR>", M.buf),
+					{ noremap = true, silent = true }
+				)
+			end
+		end,
+	})
+end
+
+function M.create_floating_window()
+	local buf = vim.api.nvim_create_buf(false, true)
+	local win_width = math.floor(vim.o.columns * 0.8)
+	local win_height = math.floor(vim.o.lines * 0.8)
+	local win_opts = {
+		relative = "editor",
+		width = win_width,
+		height = win_height,
+		row = math.floor((vim.o.lines - win_height) / 2),
+		col = math.floor((vim.o.columns - win_width) / 2),
+		style = "minimal",
+		border = "rounded",
+	}
+
+	local win = vim.api.nvim_open_win(buf, true, win_opts)
+
+	-- vim.api.nvim_buf_set_option(M.buf, "modifiable", false)
+	-- vim.api.nvim_win_set_option(M.win, "guicursor", "")
+	-- vim.api.nvim_set_option_value("modifiable", false, { buf = M.buf })
+
+	return buf, win, win_opts
+end
+
 function M.monitor()
+	local serial_command = string.format("arduino-cli monitor -p %s -c %s", M.port, M.baudrate)
+
+	if M.buf == nil or not vim.api.nvim_buf_is_valid(M.buf) then
+		M.buf, M.win, M.win_opts = M.create_floating_window()
+
+		-- Set buffer options
+		-- vim.api.nvim_buf_set_option(buf, "modifiable", true)
+
+		-- Add a header to the buffer
+		vim.api.nvim_buf_set_lines(M.buf, 0, 0, false, {
+			"Arduino Serial Monitor - Press Ctrl-C to exit",
+			"Port: " .. M.port .. " | Baudrate: " .. M.baudrate,
+			"---------------------------------------------------",
+			"",
+		})
+	end
+
+	if M.job_id then
+		vim.fn.jobstop(M.job_id)
+		M.job_id = nil
+	end
+
+	-- Start the job
+	M.job_id = vim.fn.jobstart(serial_command, {
+		stdout_buffered = false,
+		on_stdout = function(_, data)
+			if data then
+				M.append_to_buffer(data, M.buf, M.win, M.win_opts)
+				-- set cursor to the end of the buffer and the end of the line
+				-- 	{ vim.api.nvim_buf_line_count(M.buf), vim.api.nvim_buf_get_lines(M.buf, -1, -1, false)[1]:len() }
+				-- )
+			end
+		end,
+		on_stderr = function(_, data)
+			if data and #data > 0 and data[1]:match("%S") then
+				M.append_to_buffer(
+					vim.tbl_map(function(line)
+						return "Error: " .. line
+					end, data),
+					M.buf,
+					M.win,
+					M.win_opts
+				)
+			end
+		end,
+	})
+
+	vim.api.nvim_buf_set_keymap(
+		M.buf,
+		"n",
+		"<C-c>",
+		string.format("<cmd>lua vim.fn.jobstop(%d); vim.api.nvim_buf_delete(%d, {force=true})<CR>", M.job_id, M.buf),
+		{ noremap = true, silent = true }
+	)
+
+	-- Set a keymap to hide the floating window without stopping the job
+	-- Set a keymap to hide the floating window without stopping the job
+	vim.api.nvim_buf_set_keymap(
+		M.buf,
+		"n",
+		"<C-t>",
+		string.format("<cmd>lua vim.api.nvim_win_close(%d, true)<CR>", M.win),
+		{ noremap = true, silent = true }
+	)
+end
+
+function M.reopen_monitor()
+	if M.buf ~= nil and vim.api.nvim_buf_is_valid(M.buf) then
+		-- Reopen the window with the existing buffer
+		M.win = vim.api.nvim_open_win(M.buf, true, M.win_opts)
+	else
+		-- If buffer is invalid, start a new monitor session
+		M.monitor()
+	end
+end
+
+function M.monitor2()
 	local serial_command = string.format("arduino-cli monitor -p %s -c %s", M.port, M.baudrate)
 
 	local buf = vim.api.nvim_create_buf(false, true)
@@ -429,7 +657,7 @@ function M.setup(opts)
 		M.check()
 	end, {})
 	vim.api.nvim_create_user_command("InoUpload", function()
-		M.upload()
+		M.upload_and_monitor()
 	end, {})
 	vim.api.nvim_create_user_command("InoGUI", function()
 		M.gui()
@@ -445,6 +673,9 @@ function M.setup(opts)
 	end, {})
 	vim.api.nvim_create_user_command("InoList", function()
 		M.InoList()
+	end, {})
+	vim.api.nvim_create_user_command("InoReopenMonitor", function()
+		M.reopen_monitor()
 	end, {})
 	local lsp = require("arduino-tools.lsp")
 	lsp.setup(opts)
